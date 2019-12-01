@@ -23,6 +23,17 @@ fn enqueue<'a>(
     Ok(buf)
 }
 
+fn enqueue_many<'a>(
+    ring_buffer: &'a mut RingBuffer<'static, Vec<u8>>,
+    mtu: usize,
+) -> &'a mut [Vec<u8>] {
+    let bufs = ring_buffer.enqueue_many(10);
+    for buf in bufs.iter_mut() {
+        buf.resize(mtu, 0);
+    }
+    bufs
+}
+
 fn deque<'a>(ring_buffer: &'a mut RingBuffer<'static, Vec<u8>>) -> Option<&'a mut Vec<u8>> {
     //    NLL 目前没法支持这种类型的代码，只能写出这样来绕过 borrow checker
     //    loop {
@@ -67,6 +78,10 @@ impl PhonySocket {
 
     pub fn populate_rx(&mut self) -> Option<&mut Vec<u8>> {
         enqueue(&mut self.rx, self.mtu).ok()
+    }
+
+    pub fn populate_rx_many(&mut self) -> &mut [Vec<u8>] {
+        enqueue_many(&mut self.rx, self.mtu)
     }
 
     pub fn vacate_tx(&mut self) -> Option<&mut Vec<u8>> {

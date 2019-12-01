@@ -1,14 +1,17 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
+#![allow(dead_code)]
 use libc::*;
+
 use std::io;
-use std::io::{Error, Read, Result, Write};
+use std::io::{Error, Result};
 use std::mem::size_of;
 use std::mem::size_of_val;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::ptr::null_mut;
 
 const CTRL_NAME: &[u8] = b"com.apple.net.utun_control";
+const MSG_DONTWAIT: i32 = 0x80;
 
 #[repr(C)]
 pub struct ctl_info {
@@ -39,9 +42,47 @@ union IfrIfru {
 }
 
 #[repr(C)]
+#[allow(non_camel_case_types)]
 pub struct ifreq {
     ifr_name: [c_uchar; IF_NAMESIZE],
     ifr_ifru: IfrIfru,
+}
+
+#[allow(non_camel_case_types)]
+#[repr(C)]
+struct msghdr_x {
+    msg_name: *mut libc::c_void,
+    /* optional address */
+    msg_namelen: libc::socklen_t,
+    /* size of address */
+    msg_iov: *mut libc::iovec,
+    /* scatter/gather array */
+    msg_iovlen: libc::c_int,
+    /* # elements in msg_iov */
+    msg_control: *mut libc::c_void,
+    /* ancillary data, see below */
+    msg_controllen: libc::socklen_t,
+    /* ancillary data buffer len */
+    msg_flags: libc::c_int,
+    /* flags on received message */
+    msg_datalen: libc::size_t,
+    /* byte length of buffer in msg_iov */
+}
+
+extern "C" {
+    fn recvmsg_x(
+        s: libc::c_int,
+        msgp: *const msghdr_x,
+        cnt: libc::c_uint,
+        flags: libc::c_int,
+    ) -> libc::ssize_t;
+
+    fn sendmsg_x(
+        s: libc::c_int,
+        msgp: *const msghdr_x,
+        cnt: libc::c_uint,
+        flags: libc::c_int,
+    ) -> libc::ssize_t;
 }
 
 const CTLIOCGINFO: u64 = 0x0000_0000_c064_4e03;
@@ -184,6 +225,85 @@ impl TunSocket {
         Ok(unsafe { ifr.ifr_ifru.ifru_mtu } as _)
     }
 
+    pub fn recvmsg(&self, buf: &mut [u8]) -> Result<usize> {
+        let mut hdr = [0u8; 4];
+
+        let mut iov = [
+            iovec {
+                iov_base: hdr.as_mut_ptr() as _,
+                iov_len: hdr.len(),
+            },
+            iovec {
+                iov_base: buf.as_mut_ptr() as _,
+                iov_len: buf.len(),
+            },
+        ];
+
+        let mut msg_hdr = msghdr {
+            msg_name: null_mut(),
+            msg_namelen: 0,
+            msg_iov: &mut iov[0],
+            msg_iovlen: iov.len() as _,
+            msg_control: null_mut(),
+            msg_controllen: 0,
+            msg_flags: 0,
+        };
+
+        match unsafe { recvmsg(self.fd, &mut msg_hdr, 0) } {
+            -1 => Err(io::Error::last_os_error()),
+            0..=4 => Ok(0),
+            n => Ok((n - 4) as usize),
+        }
+    }
+
+    pub fn recvmmsg(&self, buf: &[&mut [u8]]) -> Result<Vec<usize>> {
+        let mut hdr = [0u8; 4];
+
+        let mut msg_iovs = Vec::with_capacity(buf.len());
+        for iov in buf.iter() {
+            let msg_iov = [
+                iovec {
+                    iov_base: hdr.as_mut_ptr() as _,
+                    iov_len: hdr.len(),
+                },
+                iovec {
+                    iov_base: iov.as_ptr() as _,
+                    iov_len: iov.len(),
+                },
+            ];
+            msg_iovs.push(msg_iov);
+        }
+
+        let mut msgp = Vec::with_capacity(buf.len());
+        for msg_iov in msg_iovs.iter_mut() {
+            let msghdr = msghdr_x {
+                msg_name: null_mut(),
+                msg_namelen: 0,
+                msg_iov: msg_iov.as_mut_ptr(),
+                msg_iovlen: msg_iov.len() as _,
+                msg_control: null_mut(),
+                msg_controllen: 0,
+                msg_flags: 0,
+                msg_datalen: 0,
+            };
+
+            msgp.push(msghdr);
+        }
+        let n_packets =
+            match unsafe { recvmsg_x(self.fd, msgp.as_ptr(), msgp.len() as u32, MSG_DONTWAIT) } {
+                -1 => {
+                    return Err(io::Error::last_os_error());
+                }
+                n => n as usize,
+            };
+        let mut sizes = Vec::with_capacity(n_packets);
+        for msghdr in &msgp[..n_packets] {
+            sizes.push(msghdr.msg_datalen - 4);
+        }
+
+        Ok(sizes)
+    }
+
     fn af_write(&self, src: &[u8], af: u8) -> Result<usize> {
         let mut hdr = [0u8, 0u8, 0u8, af as u8];
         let mut iov = [
@@ -213,71 +333,54 @@ impl TunSocket {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn write6(&self, src: &[u8]) -> Result<usize> {
-        self.af_write(src, AF_INET6 as u8)
-    }
-}
-
-impl Read for TunSocket {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        (&*self).read(buf)
-    }
-}
-
-impl Write for TunSocket {
-    fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        (&*self).write(buf)
+    pub fn sendmsg(&self, buf: &[u8]) -> Result<usize> {
+        self.af_write(buf, AF_INET as u8)
     }
 
-    fn flush(&mut self) -> Result<()> {
-        Ok(())
-    }
-}
+    pub fn sendmmsg(&self, bufs: &[&[u8]]) -> Result<Vec<usize>> {
+        let mut hdr = [0u8, 0u8, 0u8, AF_INET as u8];
 
-impl Read for &TunSocket {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        fn read(fd: RawFd, buf: &mut [u8]) -> Result<usize> {
-            let mut hdr = [0u8; 4];
-
-            let mut iov = [
+        let mut msg_iovs = Vec::with_capacity(bufs.len());
+        for iov in bufs.iter() {
+            let msg_iov = [
                 iovec {
                     iov_base: hdr.as_mut_ptr() as _,
                     iov_len: hdr.len(),
                 },
                 iovec {
-                    iov_base: buf.as_mut_ptr() as _,
-                    iov_len: buf.len(),
+                    iov_base: iov.as_ptr() as _,
+                    iov_len: iov.len(),
                 },
             ];
+            msg_iovs.push(msg_iov);
+        }
 
-            let mut msg_hdr = msghdr {
+        let mut msgp = Vec::with_capacity(bufs.len());
+        for msg_iov in msg_iovs.iter_mut() {
+            let msghdr = msghdr_x {
                 msg_name: null_mut(),
                 msg_namelen: 0,
-                msg_iov: &mut iov[0],
-                msg_iovlen: iov.len() as _,
+                msg_iov: msg_iov.as_mut_ptr(),
+                msg_iovlen: msg_iov.len() as _,
                 msg_control: null_mut(),
                 msg_controllen: 0,
                 msg_flags: 0,
+                msg_datalen: 0,
             };
 
-            match unsafe { recvmsg(fd, &mut msg_hdr, 0) } {
-                -1 => Err(io::Error::last_os_error()),
-                0..=4 => Ok(0),
-                n => Ok((n - 4) as usize),
-            }
+            msgp.push(msghdr);
+        }
+        let n_packets =
+            match unsafe { sendmsg_x(self.fd, msgp.as_ptr(), msgp.len() as u32, MSG_DONTWAIT) } {
+                -1 => return Err(io::Error::last_os_error()),
+                n => n as usize,
+            };
+        dbg!(n_packets);
+        let mut sizes = Vec::with_capacity(n_packets);
+        for buf in &bufs[..n_packets] {
+            sizes.push(buf.len());
         }
 
-        read(self.fd, buf)
-    }
-}
-
-impl Write for &TunSocket {
-    fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        self.af_write(buf, AF_INET as u8)
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        Ok(())
+        Ok(sizes)
     }
 }

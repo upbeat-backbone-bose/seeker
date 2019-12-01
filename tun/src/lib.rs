@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use smoltcp::socket::{Socket, SocketHandle, SocketSet};
 use smoltcp::time::Instant;
 use smoltcp::wire::Ipv4Cidr;
-use tracing::{debug, error, trace};
+use tracing::{debug, error};
 
 use iface::ethernet::{Interface, InterfaceBuilder};
 use iface::phony_socket::PhonySocket;
@@ -142,7 +142,6 @@ impl Stream for TunListen {
             }
 
             if let Some(s) = mut_tun.new_sockets.pop() {
-                trace!("new socket accepted: {}", s);
                 return Poll::Ready(Some(Ok(s)));
             }
 
@@ -150,26 +149,30 @@ impl Stream for TunListen {
 
             {
                 let phony_socket = mut_tun.iface.device_mut();
-                let mut total_size = 0;
-                while let Some(buf) = phony_socket.populate_rx() {
-                    let size = match Pin::new(&mut mut_tun.tun).poll_read(cx, buf) {
-                        Poll::Ready(Ok(size)) => {
-                            buf.truncate(size);
-                            trace!("tun.poll_read size {}", size);
-                            size
-                        }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                let socket_bufs = phony_socket.populate_rx_many();
+                if !socket_bufs.is_empty() {
+                    let mut bufs: Vec<&mut [u8]> = socket_bufs
+                        .iter_mut()
+                        .map(|buf| buf.as_mut_slice())
+                        .collect();
+                    let sizes: Vec<usize> = match mut_tun.tun.poll_recvmmsg(cx, bufs.as_mut_slice())
+                    {
                         Poll::Pending => {
-                            buf.clear();
-                            if total_size > 0 {
-                                trace!("tun.poll_read will block, total read size: {}", total_size);
-                                break;
-                            } else {
-                                return Poll::Pending;
+                            for buf in socket_bufs {
+                                buf.clear();
                             }
+                            return Poll::Pending;
                         }
+                        Poll::Ready(Ok(sizes)) => sizes,
+                        Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
                     };
-                    total_size += size;
+
+                    for (buf, size) in socket_bufs.iter_mut().zip(sizes.iter()) {
+                        buf.truncate(*size);
+                    }
+                    for buf in socket_bufs[sizes.len()..].iter_mut() {
+                        buf.clear();
+                    }
                 }
             }
 
@@ -300,7 +303,8 @@ impl Future for TunWrite {
                 match buf {
                     Some(buf) if buf.is_empty() => {}
                     Some(buf) => {
-                        let size = ready!(Pin::new(&mut mut_tun.tun).poll_write(cx, &buf)).unwrap();
+                        let size =
+                            ready!(Pin::new(&mut mut_tun.tun).poll_sendmsg(cx, &buf)).unwrap();
                         assert_eq!(size, buf.len());
                         debug!("write {} bytes to tun.", size);
                     }
@@ -331,7 +335,7 @@ mod tests {
     fn test_accept_tcp() {
         let to_terminate = Arc::new(AtomicBool::new(false));
         Tun::setup(
-            "utun4".to_string(),
+            "utun".to_string(),
             Ipv4Addr::new(10, 0, 0, 1),
             Ipv4Cidr::new(Ipv4Address::new(10, 0, 0, 0), 24),
             to_terminate.clone(),
@@ -354,7 +358,9 @@ mod tests {
                             assert_eq!(size, 5);
                             assert_eq!(&buf[..size], "hello".as_bytes());
                         }
-                        _ => panic!(),
+                        Some(Err(e)) => panic!("{}", e),
+                        None => unreachable!(),
+                        _ => unreachable!(),
                     }
                 }
             });
