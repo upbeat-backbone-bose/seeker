@@ -202,8 +202,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         term.clone(),
     );
 
-    let _dns_setup = DNSSetup::new();
-    let _ip_forward = if config.gateway_mode {
+    let dns_setup = DNSSetup::new();
+    let ip_forward = if config.gateway_mode {
         // In gateway mode, dns server need be accessible from the network.
         config.dns_listen = "0.0.0.0:53".to_string();
         Some(IpForward::new())
@@ -217,6 +217,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             handle_connection(client, config, term.clone()).await;
         });
     });
+
+    drop(dns_setup);
+    drop(ip_forward);
 
     if ret.is_err() {
         println!("Error encountered. Bye bye...");
