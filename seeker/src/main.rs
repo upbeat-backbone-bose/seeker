@@ -214,7 +214,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let ret = std::panic::catch_unwind(|| {
         block_on(async {
             let client = RuledClient::new(config.clone(), uid, term.clone()).await;
-            None::<Option<&str>>.unwrap();
             handle_connection(client, config, term.clone()).await;
         });
     });
