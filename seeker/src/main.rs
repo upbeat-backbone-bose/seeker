@@ -7,6 +7,7 @@ use crate::client::ruled_client::RuledClient;
 use crate::client::Client;
 use async_std::io::timeout;
 use async_std::prelude::*;
+use async_std::process::exit;
 use async_std::task::{block_on, spawn};
 use clap::{App, Arg};
 use config::{Address, Config};
@@ -210,11 +211,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         None
     };
 
-    block_on(async {
-        let client = RuledClient::new(config.clone(), uid, term.clone()).await;
-
-        handle_connection(client, config, term.clone()).await;
+    let ret = std::panic::catch_unwind(|| {
+        block_on(async {
+            let client = RuledClient::new(config.clone(), uid, term.clone()).await;
+            None::<Option<&str>>.unwrap();
+            handle_connection(client, config, term.clone()).await;
+        });
     });
+
+    if ret.is_err() {
+        println!("Error encountered. Bye bye...");
+        exit(-1);
+    }
 
     println!("Stop server. Bye bye...");
     Ok(())
